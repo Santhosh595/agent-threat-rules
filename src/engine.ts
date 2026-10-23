@@ -32,6 +32,7 @@ import { loadRulesFromDirectory, loadRuleFile } from './loader.js';
 import { evaluateTraceRule } from './trace-evaluator.js';
 import { evaluateSemanticRule } from './semantic-evaluator.js';
 import { laneAllows, requiresConfirm, type Lane } from './quality/rule-contract.js';
+import { appliesToToolDefinition } from './tool-definition-scope.js';
 import { laneFromConfig } from './enforcement.js';
 import type { SessionTracker } from './session-tracker.js';
 import { computeVerdict, isModelDecided, modelDecisionsFromConfig, type ModelDecisions } from './verdict.js';
@@ -336,6 +337,16 @@ export interface ATREngineConfig {
    * Any other value throws at construction time.
    */
   modelDecisions?: ModelDecisions;
+  /**
+   * Every event this engine evaluates is an MCP tool definition: an entry of a `tools/list`
+   * document, which defines a tool and calls none (`atr scan` on such a document sets it). Rules
+   * written for a tool being called then do not run: a rule with agent_source.type `tool_call` runs
+   * only if one of its conditions reads `tool_description`, or if its subject is the tool's identity
+   * (TOOL_IDENTITY_RULES). Every other rule runs as without the option. See
+   * src/tool-definition-scope.ts. Default false: other producers (hooks, adapters, event files) are
+   * unaffected.
+   */
+  toolDefinitions?: boolean;
 }
 
 /**
@@ -453,17 +464,41 @@ export class ATREngine {
   }
 
   /**
-   * Whether this engine evaluates `rule` at all. A draft or deprecated status, or
-   * a maturity outside the lane, stops a rule before any of its conditions run,
+   * Whether this engine evaluates `rule` at all. A draft or deprecated status, a
+   * maturity outside the lane, or (on an engine constructed with
+   * `toolDefinitions: true`) a rule written for a tool being called, stops a rule
+   * before any of its conditions run,
    * so nothing about it — its false positives included — can be observed through
    * this engine. evaluateRaw() and evaluateAsync() both ask this, and a
    * measurement harness must ask it too before recording a number for a rule:
    * a rule that is never evaluated scores 0 by construction, and that 0 is not
    * a measurement.
    */
-  evaluates(rule: Pick<ATRRule, 'status' | 'maturity'>): boolean {
+  evaluates(
+    rule: Pick<ATRRule, 'status' | 'maturity'> & Partial<Pick<ATRRule, 'id' | 'agent_source' | 'detection'>>,
+  ): boolean {
     if (rule.status === 'deprecated' || rule.status === 'draft') return false;
+    // An engine scanning tool definitions does not run the rules written for a tool being called.
+    if (this.config.toolDefinitions === true && !appliesToToolDefinition(rule)) return false;
     return this.passesLane(rule);
+  }
+
+  /**
+   * On an engine constructed with `toolDefinitions: true`: how many loaded rules it evaluates, and how
+   * many it would evaluate (status and lane allow them) but leaves out because they were written for
+   * a tool being called. Null on any other engine. Lets a report say "not run" instead of reading as
+   * "ran and found nothing".
+   */
+  getToolDefinitionScope(): { rulesEvaluated: number; rulesSkippedByScope: number } | null {
+    if (this.config.toolDefinitions !== true) return null;
+    let rulesEvaluated = 0;
+    let rulesSkippedByScope = 0;
+    for (const rule of this.rules) {
+      if (rule.status === 'deprecated' || rule.status === 'draft' || !this.passesLane(rule)) continue;
+      if (appliesToToolDefinition(rule)) rulesEvaluated += 1;
+      else rulesSkippedByScope += 1;
+    }
+    return { rulesEvaluated, rulesSkippedByScope };
   }
 
   /** Active detection lane (config, else 'hunt'). Diagnostics/tests. */
@@ -1074,8 +1109,7 @@ export class ATREngine {
           return false;
         }
         // Fallback: compile on the fly (ReDoS-gated — see safeCompile)
-        const spec = regexConditionSpec(value);
-        const regex = safeCompile(spec.source, spec.flags);
+        const regex = compileRegexCondition(value);
         if (regex && testNormalisedThenRaw(regex, fieldValue, rawFieldValue)) {
           if (suppressInCodeBlocks && codeRanges.length > 0 && isInsideCodeBlock(fieldValue, regex, codeRanges)) {
             return false;
@@ -1671,8 +1705,7 @@ export class ATREngine {
       for (let i = 0; i < conditions.length; i++) {
         const cond = conditions[i] as unknown as Record<string, unknown>;
         if (cond['operator'] === 'regex' && typeof cond['value'] === 'string') {
-          const spec = regexConditionSpec(cond['value'] as string);
-          const compiledRe = safeCompile(spec.source, spec.flags, rule.id);
+          const compiledRe = compileRegexCondition(cond['value'] as string, rule.id);
           if (compiledRe) ruleMap.set(String(i), [compiledRe]);
         }
       }
@@ -2074,8 +2107,9 @@ export interface RegexConditionSpec {
 
 /**
  * The engine's single definition of how an array-format `operator: regex`
- * condition is compiled. Both compile sites in ATREngine call it (compilePatterns()
- * and the on-the-fly fallback in evaluateArrayCondition()), and
+ * condition is compiled (SPEC §6.4). Both compile sites in ATREngine reach it
+ * through compileRegexCondition() (compilePatterns() and the on-the-fly fallback
+ * in evaluateArrayCondition()), so does ShadowEvaluator, and
  * scripts/gate-case-sensitivity.ts imports it, because it has to see each pattern
  * exactly as the engine does. That gate used to keep its own copy of this logic,
  * and the copy went stale when needsUnicodeFlag() started setting `u` for astral
@@ -2090,6 +2124,21 @@ export function regexConditionSpec(value: string): RegexConditionSpec {
   const inline = LEADING_INLINE_FLAGS.exec(value);
   const source = normalizeRegex(value);
   return { source, inlineFlags: inline?.[1] ?? '', flags: needsUnicodeFlag(source) ? 'iu' : 'i' };
+}
+
+/**
+ * Compile an array-format `operator: regex` value the way the engine does: the
+ * leading flag group handled by regexConditionSpec(), then the ReDoS gate in
+ * safeCompile(). Returns null for a pattern the gate rejects or that does not
+ * compile; such a condition never matches. Exported for code outside
+ * ATREngine, such as ShadowEvaluator and RuleScaffolder, that must compile a
+ * condition exactly as the engine does.
+ *
+ * @internal Not re-exported from the package entry point.
+ */
+export function compileRegexCondition(value: string, ruleId?: string): RegExp | null {
+  const spec = regexConditionSpec(value);
+  return safeCompile(spec.source, spec.flags, ruleId);
 }
 
 /**
@@ -2303,8 +2352,11 @@ const MAX_EVAL_LENGTH = 100_000;
 /**
  * Safely test a regex pattern against input with length limits.
  * Returns false if input exceeds MAX_EVAL_LENGTH to prevent ReDoS.
+ * Exported so ShadowEvaluator and RuleScaffolder apply the same limit as the engine.
+ *
+ * @internal Not re-exported from the package entry point.
  */
-function safeRegexTest(regex: RegExp, input: string): boolean {
+export function safeRegexTest(regex: RegExp, input: string): boolean {
   if (input.length > MAX_EVAL_LENGTH) return false;
   return regex.test(input);
 }
